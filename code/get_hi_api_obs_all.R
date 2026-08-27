@@ -29,6 +29,11 @@
 # code/ directory this script lives in (Rscript --file=...; falls back to
 # the working directory if the script is sourced interactively). The
 # project root -- where the data directories live -- is its parent.
+
+# progress goes to stdout via say(), not message()/stderr, so the cron job's
+# .err log collects only real problems (warnings and errors). say() matches
+# message() semantics: arguments pasted with no separator, newline appended.
+say <- function(...) cat(..., "\n", sep = "")
 codeDir <- local({
   fa <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
   if (length(fa))
@@ -94,7 +99,7 @@ catalog_age <- function(path) {
 
 age   <- catalog_age(catalog_csv)
 stale <- age > max_catalog_age
-if (stale) message(sprintf(
+if (stale) say(sprintf(
   "Catalog %s (age %s, limit %.0f h) — rebuilding from the API",
   if (file.exists(catalog_csv)) "is stale" else "not found",
   if (is.finite(age)) sprintf("%.1f h", age / 3600) else "unknown",
@@ -133,7 +138,7 @@ targets <- select_targets(catalog)
 # checks missed. Rebuild once and retry rather than failing. Never runs in
 # normal operation, and cannot loop — stale is TRUE on the retry.
 if (nrow(targets) == 0 && !stale) {
-  message("No live stations in the cached catalog — forcing a rebuild and retrying")
+  say("No live stations in the cached catalog — forcing a rebuild and retrying")
   catalog <- get_station_catalog(state, cores = n_cores, refresh = TRUE)
   stale   <- TRUE
   targets <- select_targets(catalog)
@@ -146,7 +151,7 @@ if (nrow(targets) == 0)
        nrow(catalog), " stations listed) — the API is likely down or ",
        "returning nothing within the last ", alive_window / 86400, " days.")
 
-message(sprintf(
+say(sprintf(
   "%d of %d catalog stations alive on the API; fetch windows %.1f to %.1f hrs",
   nrow(targets), nrow(catalog),
   min(as.numeric(end_time - targets$fetch_start, units = "hours")),
@@ -202,9 +207,10 @@ fetch_station <- function(id, provider, start) {
   parse_feats(fs, id, provider)
 }
 
-message("Fetching observations on ", n_cores, " cores...")
+say("Fetching observations on ", n_cores, " cores...")
 cl <- makeCluster(n_cores)
-invisible(clusterEvalQ(cl, { library(httr2); library(purrr); library(tibble) }))
+invisible(clusterEvalQ(cl, { suppressPackageStartupMessages({ library(httr2)
+    library(purrr); library(tibble) }) }))
 clusterExport(cl, c("num_vars", "ua", "iso_utc", "end_time",
                     "parse_feats", "obs_url", "get_window", "fetch_station"))
 
@@ -219,7 +225,7 @@ for (b in batches) {
   }, ids = targets$station_id, provs = targets$provider,
      starts = targets$fetch_start)
   results <- c(results, res)
-  message(sprintf("...%d/%d stations", max(b), nrow(targets)))
+  say(sprintf("...%d/%d stations", max(b), nrow(targets)))
 }
 stopCluster(cl)
 
@@ -243,13 +249,13 @@ obs_long <- obs_long |>
 sum_by_prov <- obs_long |>
   group_by(provider) |>
   summarise(stations = n_distinct(station_id), rows = n())
-message(paste(capture.output(print(as.data.frame(sum_by_prov))), collapse = "\n"))
-message(sprintf("TOTAL: %d rows, %d stations reporting (of %d targeted)",
+say(paste(capture.output(print(as.data.frame(sum_by_prov))), collapse = "\n"))
+say(sprintf("TOTAL: %d rows, %d stations reporting (of %d targeted)",
                 nrow(obs_long), n_distinct(obs_long$station_id), nrow(targets)))
 
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 write.csv(obs_long, obs_path, row.names = FALSE)
-message("Written to ", obs_path)
+say("Written to ", obs_path)
 
 # --- 5. Refresh the catalog so it reflects this fetch ----------------------
 invisible(get_station_catalog("HI", cores = n_cores, refresh = TRUE))

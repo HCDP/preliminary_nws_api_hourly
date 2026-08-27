@@ -14,8 +14,13 @@
 # On overlapping keys the INCOMING row wins, so corrected values from a
 # fresh pull replace what the master already had.
 
-library(dplyr)
-library(readr)   # much faster than read.csv at master-file scale (millions of rows)
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(readr))   # much faster than read.csv at master-file scale (millions of rows)
+
+# progress goes to stdout via say(), not message()/stderr, so the cron job's
+# .err log collects only real problems (warnings and errors). say() matches
+# message() semantics: arguments pasted with no separator, newline appended.
+say <- function(...) cat(..., "\n", sep = "")
 
 # code/ directory this script lives in; its parent is the project root, so
 # the default data_out/ matches get_hi_api_obs_all.R and the pair works
@@ -56,7 +61,7 @@ if (file.exists(master_file)) {
   master <- incoming[0, ]
   n_before <- 0
   dir.create(dirname(master_file), recursive = TRUE, showWarnings = FALSE)
-  message("No existing master — creating ", master_file)
+  say("No existing master — creating ", master_file)
 }
 
 # incoming first so it wins on duplicate keys
@@ -66,7 +71,7 @@ combined <- bind_rows(incoming, master) |>
 
 write_csv(combined, master_file, progress = FALSE)
 
-message(sprintf(
+say(sprintf(
   "master: %d rows before, %d incoming, %d after (%+d); %s to %s",
   n_before, nrow(incoming), nrow(combined), nrow(combined) - n_before,
   min(combined$datetime), max(combined$datetime)

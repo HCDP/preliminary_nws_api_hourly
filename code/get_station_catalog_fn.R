@@ -38,12 +38,17 @@
 #   Rscript code/get_station_catalog_fn.R [state] [cores]  (defaults HI, 2)
 #   -> dataCatalog/<state>_api_stations.csv (at the project root)
 
-library(httr2)
-library(purrr)
-library(dplyr)
-library(tibble)
-library(readr)
-library(parallel)
+suppressPackageStartupMessages(library(httr2))
+suppressPackageStartupMessages(library(purrr))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(tibble))
+suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(parallel))
+
+# progress goes to stdout via say(), not message()/stderr, so the cron job's
+# .err log collects only real problems (warnings and errors). say() matches
+# message() semantics: arguments pasted with no separator, newline appended.
+say <- function(...) cat(..., "\n", sep = "")
 
 # directory this code file lives in (sourced -> the sourced file's dir;
 # run via Rscript -> the script's dir; fallback -> working directory).
@@ -74,7 +79,7 @@ get_station_catalog <- function(state = "HI", latest = TRUE, cores = 2,
 
   # --- cached copy? -------------------------------------------------------
   if (!refresh && file.exists(csv_path)) {
-    message("Reading existing catalog: ", csv_path,
+    say("Reading existing catalog: ", csv_path,
             " (last modified ", format(file.mtime(csv_path)), ")")
     return(read.csv(csv_path))
   }
@@ -84,7 +89,7 @@ get_station_catalog <- function(state = "HI", latest = TRUE, cores = 2,
                  toupper(state))
   stations <- list()
   while (!is.null(url)) {
-    message("Fetching ", url)
+    say("Fetching ", url)
     page <- request(url) |>
       req_headers(`User-Agent` = ua, Accept = "application/geo+json") |>
       req_retry(max_tries = 3) |>
@@ -114,11 +119,11 @@ get_station_catalog <- function(state = "HI", latest = TRUE, cores = 2,
   }) |>
     distinct(station_id, .keep_all = TRUE) |>
     arrange(station_id)
-  message(nrow(catalog), " stations in catalog")
+  say(nrow(catalog), " stations in catalog")
 
   if (latest) {
     # --- latest_obs_api: newest observation on the API right now ----------
-    message("Fetching latest observation time per station on ", cores,
+    say("Fetching latest observation time per station on ", cores,
             " cores...")
     worker <- function(id, ua) {
       tryCatch({
@@ -146,12 +151,12 @@ get_station_catalog <- function(state = "HI", latest = TRUE, cores = 2,
                  format = "%Y-%m-%dT%H:%M:%S%z", tz = "UTC"),
       "%Y-%m-%d %H:%M:%S HST", tz = "Pacific/Honolulu"
     )
-    message(sum(!is.na(catalog$latest_obs_api)),
+    say(sum(!is.na(catalog$latest_obs_api)),
             " stations have observations on the API")
 
     # --- latest_obs_data: newest datetime in collected long data ----------
     if (file.exists(obs_file)) {
-      message("Deriving latest_obs_data from ", obs_file)
+      say("Deriving latest_obs_data from ", obs_file)
       obs <- read_csv(obs_file, col_types = cols_only(
         station_id = col_character(), datetime = col_character()),
         progress = FALSE)
@@ -164,7 +169,7 @@ get_station_catalog <- function(state = "HI", latest = TRUE, cores = 2,
                                            tz = "Pacific/Honolulu"),
                   .groups = "drop")
       catalog <- left_join(catalog, latest_tbl, by = "station_id")
-      message(sum(!is.na(catalog$latest_obs_data)), " of ", nrow(catalog),
+      say(sum(!is.na(catalog$latest_obs_data)), " of ", nrow(catalog),
               " stations have data in ", obs_file)
     } else {
       warning("obs file not found (", obs_file,
@@ -177,7 +182,7 @@ get_station_catalog <- function(state = "HI", latest = TRUE, cores = 2,
   if (write_csv) {
     dir.create(dir, recursive = TRUE, showWarnings = FALSE)
     write.csv(catalog, csv_path, row.names = FALSE)
-    message("Written to ", csv_path)
+    say("Written to ", csv_path)
   }
 
   catalog

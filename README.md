@@ -68,9 +68,11 @@ the data directories would land one level above it.
 | `code/get_hi_api_obs_all.R` | the fetcher — steps 1–5 above |
 | `code/append_hi_api_master.R` | snapshot → master accumulator |
 | `code/install_deps.R` | one-time CRAN dependency installer |
+| `cron_api.txt` | ready-to-install hourly crontab entry |
 | `dataCatalog/hi_api_stations.csv` | station catalog with freshness timestamps |
 | `data_out/hi_api_obs_long.csv` | latest fetch window (overwritten each run) |
 | `data_out/hi_api_master.csv` | permanent deduplicated record |
+| `runlogs/` | cron stdout/stderr logs (gitignored) |
 
 ## Usage
 
@@ -87,6 +89,51 @@ scripts anchor their own paths, cron can call them by absolute path with no
 Rscript /path/to/code/get_hi_api_obs_all.R && \
   Rscript /path/to/code/append_hi_api_master.R
 ```
+
+### Scheduling
+
+`cron_api.txt` holds the ready-to-install crontab entry — copy its second
+line into `crontab -e`:
+
+```
+7 * * * * /bin/sh -c '<abs>/code/get_hi_api_obs_all.R && <abs>/code/append_hi_api_master.R' \
+            >> <abs>/runlogs/nwsapi_hrly.out 2>> <abs>/runlogs/nwsapi_hrly.err
+```
+
+**:07 past the hour.** Unlike the RR5 product there is no single issuance
+to wait on — stations report on their own schedules, and the hourly cluster
+runs :45 through :59: RAWS/MECO at :50 and :45 (201 stations), H1 gauges
+sub-hourly at :00/:15/:30/:45 (142), ASOS airports last at :51–:59 (13).
+Ingest lag is a few minutes. Starting at :07 means everything issued during
+the previous clock hour has been both issued and ingested, so each run
+collects a complete hour. Running at :55 would catch the RAWS block but cut
+the airports off mid-report — no data lost, but airport observations would
+always trail an hour.
+
+:07 also staggers this workflow away from the RR5 job at :45. This one is
+much heavier — ~362 station requests plus a full catalog rebuild (573
+listings and one observation request each), effectively serial since
+`n_cores` is pinned to 1 — so a run takes about 5 minutes and finishes well
+before :45.
+
+The `/bin/sh -c '...'` wrapper is required, not cosmetic: written bare, the
+redirects would attach only to the second command and the fetcher's output
+would go to cron's mail instead of the log.
+
+Output lands in `runlogs/` (gitignored, created on demand):
+
+| File | Holds |
+|---|---|
+| `runlogs/nwsapi_hrly.out` | the full run transcript — every progress line |
+| `runlogs/nwsapi_hrly.err` | **only** warnings and errors; empty after a clean run |
+
+That split is why the scripts report progress with `say()` (a thin `cat()`
+wrapper) rather than `message()`, and wrap `library()` in
+`suppressPackageStartupMessages()` — both of those write to stderr in R,
+which would otherwise fill `.err` with routine chatter on every run. A
+station whose endpoint returns HTTP 500 shows up in `.err` as a one-line
+warning while the run continues. Note the logs append, so they grow without
+bound; rotate or truncate them if that matters.
 
 ### What a run needs locally
 
