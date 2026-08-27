@@ -21,7 +21,10 @@
 #   4. After writing data_out/hi_api_obs_long.csv, refreshes the catalog
 #      (refresh = TRUE) so the file reflects this fetch.
 #
-# Usage:  Rscript code/get_hi_api_obs_all.R [cores]   (default 2)
+# Usage:  Rscript code/get_hi_api_obs_all.R
+#         Runs on 1 core -- n_cores is pinned below and any argument is
+#         ignored. Restore the commented-out expression there to re-enable
+#         the [cores] argument.
 # Output: data_out/hi_api_obs_long.csv, dataCatalog/hi_api_stations.csv
 #         (both are created at the project root -- the parent of code/ --
 #         NOT in the working directory)

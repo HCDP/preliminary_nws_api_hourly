@@ -77,8 +77,8 @@ the data directories would land one level above it.
 ## Usage
 
 ```bash
-Rscript code/get_hi_api_obs_all.R [cores]   # fetch (default 2 cores)
-Rscript code/append_hi_api_master.R         # fold into the master
+Rscript code/get_hi_api_obs_all.R    # fetch (runs on 1 core)
+Rscript code/append_hi_api_master.R  # fold into the master
 ```
 
 Run both, in that order, on a schedule (hourly works well). Because the
