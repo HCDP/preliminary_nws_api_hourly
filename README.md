@@ -2,11 +2,12 @@
 
 Hourly, catalog-driven collection of surface observations for ~470 Hawaii
 stations from the National Weather Service API (`api.weather.gov`), covering
-four networks: airports (ASOS/AWOS), RAWS and Hawaiian Electric (MECO)
-stations, H1 hydro gauges, and buoys. Each run fetches only the data each
-station is missing and folds it into a permanent, deduplicated master table.
+six networks: airports (ASOS/AWOS), RAWS and Hawaiian Electric (MECO)
+stations, RAWS fire-weather gauges, H1 hydro gauges, HADS coastal
+stations, and buoys. Each run fetches only the data each station is
+missing and folds it into a permanent, deduplicated master table.
 
-![NWS API observations workflow](workflow_api.png)
+![NWS API observations workflow](workflow_api.svg)
 
 ## How it works
 
@@ -51,16 +52,19 @@ must happen at least weekly to avoid gaps).
 ## Files
 
 All R code lives in `code/`; data directories sit beside it at the project
-root, so the scripts run correctly from any working directory.
+root. Every path comes from the environment, so the scripts run correctly
+from any working directory — and refuse to run at all without it.
 
 ```
-<project root>/          <- data_out/ and dataCatalog/ are created here
-`-- code/                <- all four .R files live here, together
+$NWSAPI_PROJECT_ROOT/    <- REQUIRED; data_out/ and dataCatalog/ land here
+|-- code/                <- all four .R files live here, together
+`-- envs/nwsapi.env      <- the variables, ready to source
 ```
 
-Each script resolves its own location and takes the **parent** as the data
-root, so this nesting matters: put the code at the project root instead and
-the data directories would land one level above it.
+Nothing is inferred from a script's own location. `NWSAPI_PROJECT_ROOT` must
+be exported before either script runs; an unset root, or one pointing at a
+directory that does not exist, is a fatal error rather than a silent
+fallback. See [Directory configuration](#directory-configuration).
 
 | File | Role |
 |---|---|
@@ -69,36 +73,85 @@ the data directories would land one level above it.
 | `code/append_hi_api_master.R` | snapshot → master accumulator |
 | `code/install_deps.R` | one-time CRAN dependency installer |
 | `cron_api.txt` | ready-to-install hourly crontab entry |
+| `envs/nwsapi.env` | the required directory variables, ready to `source` |
 | `dataCatalog/hi_api_stations.csv` | station catalog with freshness timestamps |
 | `data_out/hi_api_obs_long.csv` | latest fetch window (overwritten each run) |
 | `data_out/hi_api_master.csv` | permanent deduplicated record |
 | `runlogs/` | cron stdout/stderr logs (gitignored) |
 
+### Directory configuration
+
+All four paths come from the environment. Only the root is required; the
+three directories default to the conventional subdirectories beneath it, so
+a standard deployment needs just the one variable.
+
+| Variable | Required | Default | Holds |
+|---|---|---|---|
+| `NWSAPI_PROJECT_ROOT` | **yes** | — | project root; everything below defaults relative to it |
+| `NWSAPI_CODE_DIR` | no | `$NWSAPI_PROJECT_ROOT/code` | the `.R` files; must exist |
+| `NWSAPI_DATA_OUT` | no | `$NWSAPI_PROJECT_ROOT/data_out` | snapshot + master; created on demand |
+| `NWSAPI_DATA_CATALOG` | no | `$NWSAPI_PROJECT_ROOT/dataCatalog` | station catalog; created on demand |
+
+`envs/nwsapi.env` holds these ready to source:
+
+```bash
+. /path/to/preliminary_nws_api_hourly/envs/nwsapi.env
+```
+
+**Why required rather than inferred.** The scripts used to derive the root
+from their own location (`--file=` under `Rscript`, the sourced file's path
+when sourced, the working directory otherwise). That last fallback was the
+problem: sourced or launched in a way that lost the path, a run would
+quietly build `data_out/` and `dataCatalog/` wherever it happened to be
+standing and write a full fetch into the wrong tree. Requiring the variable
+turns that silent mis-write into an immediate, readable abort:
+
+```
+Error: NWSAPI_PROJECT_ROOT is not set. This workflow requires its directories
+to come from the environment -- export NWSAPI_PROJECT_ROOT (see
+envs/nwsapi.env) before running.
+```
+
+The names are `NWSAPI_`-prefixed rather than a bare `PROJECT_ROOT`, so no two
+of the hourly workflows can collide in a shell or crontab that has more than
+one loaded.
+
 ## Usage
 
 ```bash
+. envs/nwsapi.env                    # REQUIRED — sets NWSAPI_PROJECT_ROOT
 Rscript code/get_hi_api_obs_all.R    # fetch (runs on 1 core)
 Rscript code/append_hi_api_master.R  # fold into the master
 ```
 
-Run both, in that order, on a schedule (hourly works well). Because the
-scripts anchor their own paths, cron can call them by absolute path with no
-`cd`. Chain them so a failed fetch does not re-fold a stale snapshot:
+Run both, in that order, on a schedule (hourly works well). The scripts take
+every path from the environment, so they can be called from anywhere with no
+`cd` — but the variables must be loaded first, in the same shell. Chain them
+so a failed fetch does not re-fold a stale snapshot:
 
 ```bash
-Rscript /path/to/code/get_hi_api_obs_all.R && \
-  Rscript /path/to/code/append_hi_api_master.R
+. /path/to/preliminary_nws_api_hourly/envs/nwsapi.env && \
+  Rscript "$NWSAPI_PROJECT_ROOT/code/get_hi_api_obs_all.R" && \
+  Rscript "$NWSAPI_PROJECT_ROOT/code/append_hi_api_master.R"
 ```
 
 ### Scheduling
 
-`cron_api.txt` holds the ready-to-install crontab entry — copy its second
+`cron_api.txt` holds the ready-to-install crontab entry — copy its last
 line into `crontab -e`:
 
 ```
-7 * * * * /bin/sh -c '<abs>/code/get_hi_api_obs_all.R && <abs>/code/append_hi_api_master.R' \
+7 * * * * /bin/sh -c '. <abs>/envs/nwsapi.env && C=${NWSAPI_CODE_DIR:-$NWSAPI_PROJECT_ROOT/code} \
+            && /usr/bin/Rscript "$C/get_hi_api_obs_all.R" \
+            && /usr/bin/Rscript "$C/append_hi_api_master.R"' \
             >> <abs>/runlogs/nwsapi_hrly.out 2>> <abs>/runlogs/nwsapi_hrly.err
 ```
+
+**Sourcing the env file inside the cron command is mandatory.** Cron's
+environment is minimal and inherits nothing from an interactive shell, so a
+crontab line that just calls the scripts now aborts every run. The
+`${NWSAPI_CODE_DIR:-...}` default keeps the line correct whether or not that
+optional override is set in the env file.
 
 **:07 past the hour.** Unlike the RR5 product there is no single issuance
 to wait on — stations report on their own schedules, and the hourly cluster
@@ -141,7 +194,8 @@ The fetcher needs exactly **one** other local file.
 
 | Needed | Why |
 |---|---|
-| `code/get_station_catalog_fn.R` | sourced by the fetcher; must sit in the same directory. Missing it is fatal at startup. |
+| `NWSAPI_PROJECT_ROOT` exported | every path derives from it; unset is fatal at startup. See [Directory configuration](#directory-configuration). |
+| `code/get_station_catalog_fn.R` | sourced by the fetcher; must sit in `$NWSAPI_CODE_DIR`. Missing it is fatal at startup. |
 | R ≥ 4.1 plus `httr2`, `dplyr`, `purrr`, `tibble`, `readr` | `parallel` ships with R. Run `Rscript code/install_deps.R` once. |
 | network access to `api.weather.gov` | no API key — the API only requires a `User-Agent` header, set in the scripts |
 

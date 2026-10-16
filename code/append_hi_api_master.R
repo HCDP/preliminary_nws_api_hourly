@@ -4,7 +4,8 @@
 #
 # Usage:
 #   Rscript code/append_hi_api_master.R                     defaults below
-#     (defaults are data_out/ at the project root, not the working dir)
+#     (defaults sit in $NWSAPI_DATA_OUT, i.e. data_out/ under the REQUIRED
+#      $NWSAPI_PROJECT_ROOT -- not the working directory)
 #   Rscript code/append_hi_api_master.R new.csv master.csv  explicit paths
 #
 # Intended flow (e.g. daily scheduled task):
@@ -22,17 +23,38 @@ suppressPackageStartupMessages(library(readr))   # much faster than read.csv at 
 # message() semantics: arguments pasted with no separator, newline appended.
 say <- function(...) cat(..., "\n", sep = "")
 
-# code/ directory this script lives in; its parent is the project root, so
-# the default data_out/ matches get_hi_api_obs_all.R and the pair works
-# from any working directory
-codeDir <- local({
-  fa <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
-  if (length(fa))
-    dirname(normalizePath(sub("^--file=", "", fa[1]), winslash = "/"))
-  else getwd()
-})
-mainDir <- dirname(codeDir)
-out_dir <- file.path(mainDir, "data_out")
+# --- directories from the environment --------------------------------------
+# This workflow takes its paths from the environment rather than deriving
+# them from the script's own location. NWSAPI_PROJECT_ROOT is REQUIRED; the
+# directories under it can each be redirected individually. An unset root is
+# a hard error on purpose -- the old behaviour fell back to the script's
+# parent (or, when sourced, the working directory), which could silently
+# write a whole run into the wrong tree.
+#
+#   NWSAPI_PROJECT_ROOT        required   project root
+#   NWSAPI_CODE_DIR            optional   default $NWSAPI_PROJECT_ROOT/code
+#   NWSAPI_DATA_OUT            optional   default $NWSAPI_PROJECT_ROOT/data_out
+#   NWSAPI_DATA_CATALOG        optional   default $NWSAPI_PROJECT_ROOT/dataCatalog
+#
+# See envs/nwsapi.env for a ready-to-source file, and the cron file for how
+# the scheduled job loads it.
+.env_dir <- function(var, default = NULL, must_exist = TRUE) {
+  v <- Sys.getenv(var)
+  if (!nzchar(v)) {
+    if (is.null(default))
+      stop(var, " is not set. This workflow requires its directories to come ",
+           "from the environment -- export ", var, " (see envs/nwsapi.env) ",
+           "before running.", call. = FALSE)
+    v <- default
+  }
+  v <- path.expand(v)
+  if (must_exist && !dir.exists(v))
+    stop(var, " is set to a directory that does not exist: ", v, call. = FALSE)
+  normalizePath(v, winslash = "/", mustWork = FALSE)
+}
+mainDir <- .env_dir("NWSAPI_PROJECT_ROOT")
+out_dir <- .env_dir("NWSAPI_DATA_OUT", file.path(mainDir, "data_out"),
+                    must_exist = FALSE)
 
 args        <- commandArgs(trailingOnly = TRUE)
 new_file    <- if (length(args) >= 1) args[1] else file.path(out_dir, "hi_api_obs_long.csv")

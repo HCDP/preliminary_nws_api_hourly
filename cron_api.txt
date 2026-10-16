@@ -1,2 +1,6 @@
-# NWS API hourly observations — fetch + fold into master, :07 past every hour
-7 * * * * /bin/sh -c '/usr/bin/Rscript /home/hawaii_climate_products_container/preliminary/data_aqs_hrly/preliminary_nws_api_hourly/code/get_hi_api_obs_all.R && /usr/bin/Rscript /home/hawaii_climate_products_container/preliminary/data_aqs_hrly/preliminary_nws_api_hourly/code/append_hi_api_master.R' >> /home/hawaii_climate_products_container/preliminary/data_aqs_hrly/preliminary_nws_api_hourly/runlogs/nwsapi_hrly.out 2>> /home/hawaii_climate_products_container/preliminary/data_aqs_hrly/preliminary_nws_api_hourly/runlogs/nwsapi_hrly.err
+# NWS API hourly observations — fetch + fold into master, :07 past every hour.
+# Sources envs/nwsapi.env first: the scripts REQUIRE NWSAPI_PROJECT_ROOT and
+# abort without it, and cron's environment inherits nothing from a shell.
+# ${NWSAPI_CODE_DIR:-...} keeps the line correct whether or not that optional
+# override is set in the env file.
+7 * * * * /bin/sh -c '. /home/hawaii_climate_products_container/preliminary/data_aqs_hrly/preliminary_nws_api_hourly/envs/nwsapi.env && C=${NWSAPI_CODE_DIR:-$NWSAPI_PROJECT_ROOT/code} && /usr/bin/Rscript "$C/get_hi_api_obs_all.R" && /usr/bin/Rscript "$C/append_hi_api_master.R"' >> /home/hawaii_climate_products_container/preliminary/data_aqs_hrly/preliminary_nws_api_hourly/runlogs/nwsapi_hrly.out 2>> /home/hawaii_climate_products_container/preliminary/data_aqs_hrly/preliminary_nws_api_hourly/runlogs/nwsapi_hrly.err

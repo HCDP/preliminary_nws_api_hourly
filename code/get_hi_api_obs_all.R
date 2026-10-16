@@ -1,7 +1,7 @@
 # Catalog-driven incremental pull of api.weather.gov observations for all
-# Hawaii stations in four groups — airports (ICAO PHxx/PMDY), RAWS/MECO-style
-# (NNNHI / NNNHE), H1 hydro gauges (xxxxH1), and buoys (5-digit) — into
-# one long-format table:
+# Hawaii stations in six groups — airports (ICAO PHxx/PMDY), RAWS/MECO-style
+# (NNNHI / NNNHE), RAWS fire-weather (TXNNN), H1 hydro gauges (xxxxH1),
+# HADS coastal (PNN), and buoys (5-digit) — into one long-format table:
 #   station_id | datetime | variable | value | unit | provider
 #
 # 'provider' is the API's network attribution as provider/subProvider
@@ -25,31 +25,55 @@
 #         Runs on 1 core -- n_cores is pinned below and any argument is
 #         ignored. Restore the commented-out expression there to re-enable
 #         the [cores] argument.
-# Output: data_out/hi_api_obs_long.csv, dataCatalog/hi_api_stations.csv
-#         (both are created at the project root -- the parent of code/ --
-#         NOT in the working directory)
-
-# code/ directory this script lives in (Rscript --file=...; falls back to
-# the working directory if the script is sourced interactively). The
-# project root -- where the data directories live -- is its parent.
+# Output: $NWSAPI_DATA_OUT/hi_api_obs_long.csv and
+#         $NWSAPI_DATA_CATALOG/hi_api_stations.csv -- both default to
+#         data_out/ and dataCatalog/ under $NWSAPI_PROJECT_ROOT, which is
+#         REQUIRED in the environment (see the block below)
 
 # progress goes to stdout via say(), not message()/stderr, so the cron job's
 # .err log collects only real problems (warnings and errors). say() matches
 # message() semantics: arguments pasted with no separator, newline appended.
 say <- function(...) cat(..., "\n", sep = "")
-codeDir <- local({
-  fa <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
-  if (length(fa))
-    dirname(normalizePath(sub("^--file=", "", fa[1]), winslash = "/"))
-  else getwd()
-})
-mainDir <- dirname(codeDir)
+# --- directories from the environment --------------------------------------
+# This workflow takes its paths from the environment rather than deriving
+# them from the script's own location. NWSAPI_PROJECT_ROOT is REQUIRED; the
+# directories under it can each be redirected individually. An unset root is
+# a hard error on purpose -- the old behaviour fell back to the script's
+# parent (or, when sourced, the working directory), which could silently
+# write a whole run into the wrong tree.
+#
+#   NWSAPI_PROJECT_ROOT        required   project root
+#   NWSAPI_CODE_DIR            optional   default $NWSAPI_PROJECT_ROOT/code
+#   NWSAPI_DATA_OUT            optional   default $NWSAPI_PROJECT_ROOT/data_out
+#   NWSAPI_DATA_CATALOG        optional   default $NWSAPI_PROJECT_ROOT/dataCatalog
+#
+# See envs/nwsapi.env for a ready-to-source file, and the cron file for how
+# the scheduled job loads it.
+.env_dir <- function(var, default = NULL, must_exist = TRUE) {
+  v <- Sys.getenv(var)
+  if (!nzchar(v)) {
+    if (is.null(default))
+      stop(var, " is not set. This workflow requires its directories to come ",
+           "from the environment -- export ", var, " (see envs/nwsapi.env) ",
+           "before running.", call. = FALSE)
+    v <- default
+  }
+  v <- path.expand(v)
+  if (must_exist && !dir.exists(v))
+    stop(var, " is set to a directory that does not exist: ", v, call. = FALSE)
+  normalizePath(v, winslash = "/", mustWork = FALSE)
+}
+mainDir     <- .env_dir("NWSAPI_PROJECT_ROOT")
+codeDir     <- .env_dir("NWSAPI_CODE_DIR",     file.path(mainDir, "code"))
+out_dir     <- .env_dir("NWSAPI_DATA_OUT",     file.path(mainDir, "data_out"),
+                        must_exist = FALSE)
+catalog_dir <- .env_dir("NWSAPI_DATA_CATALOG", file.path(mainDir, "dataCatalog"),
+                        must_exist = FALSE)
 
-# loads httr2/dplyr/purrr/tibble/readr/parallel and get_station_catalog()
+# loads httr2/dplyr/purrr/tibble/readr/parallel and get_station_catalog();
+# it resolves the same variables independently
 source(file.path(codeDir, "get_station_catalog_fn.R"))
 
-# data lives at the project root, not in the working directory
-out_dir  <- file.path(mainDir, "data_out")
 obs_path <- file.path(out_dir, "hi_api_obs_long.csv")
 
 args    <- commandArgs(trailingOnly = TRUE)
@@ -86,7 +110,7 @@ parse_hst <- function(x) as.POSIXct(sub(" HST$", "", x), tz = "Pacific/Honolulu"
 #   file age  — nobody has run this lately
 #   data age  — the file was copied/restored/touched, so its mtime lies
 state       <- "HI"
-catalog_csv <- file.path(mainDir, "dataCatalog",
+catalog_csv <- file.path(catalog_dir,
                          sprintf("%s_api_stations.csv", tolower(state)))
 
 catalog_age <- function(path) {
@@ -113,6 +137,8 @@ catalog <- get_station_catalog(state, cores = n_cores, refresh = stale)
 classify <- function(id) {
   if (grepl("^P[HM][A-Z0-9]{2}$", id)) "airport"
   else if (grepl("^[0-9]{3}H[IE]$", id)) "raws_meco"
+  else if (grepl("^T[A-Z][0-9]{3}$", id)) "raws_fire"
+  else if (grepl("^P[0-9]{2}$", id))     "hads_coastal"
   else if (grepl("H1$", id))             "h1_gauge"
   else if (grepl("^[0-9]{5}$", id))      "buoy"
   else NA_character_
