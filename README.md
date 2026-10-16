@@ -1,6 +1,6 @@
 # NWS API observations workflow
 
-Hourly, catalog-driven collection of surface observations for ~470 Hawaii
+Hourly, catalog-driven collection of surface observations for Hawaii
 stations from the National Weather Service API (`api.weather.gov`), covering
 six networks: airports (ASOS/AWOS), RAWS and Hawaiian Electric (MECO)
 stations, RAWS fire-weather gauges, H1 hydro gauges, HADS coastal
@@ -37,7 +37,8 @@ Each run:
    a brand-new station gets the full 7 days. Fetches run in parallel.
 4. **Write the snapshot** — `data_out/hi_api_obs_long.csv`, long format:
    `station_id | datetime | variable | value | unit | provider`
-   (16 SI-unit variables; datetimes as `YYYY-MM-DD HH:MM:SS HST`).
+   (16 SI-unit variables requested, 14 of which have ever appeared;
+   datetimes as `YYYY-MM-DD HH:MM:SS HST`).
 5. **Refresh the catalog** — the run ends by rebuilding the catalog with
    updated timestamps, so the next run knows exactly what is missing.
 6. **Append to the master** — `code/append_hi_api_master.R` folds the
@@ -164,7 +165,7 @@ the airports off mid-report — no data lost, but airport observations would
 always trail an hour.
 
 :07 also staggers this workflow away from the RR5 job at :45. This one is
-much heavier — ~362 station requests plus a full catalog rebuild (573
+much heavier — ~380 station requests plus a full catalog rebuild (~580
 listings and one observation request each), effectively serial since
 `n_cores` is pinned to 1 — so a run takes about 5 minutes and finishes well
 before :45.
