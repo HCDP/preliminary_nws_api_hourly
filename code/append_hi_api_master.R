@@ -14,6 +14,11 @@
 #
 # On overlapping keys the INCOMING row wins, so corrected values from a
 # fresh pull replace what the master already had.
+#
+# 'datetime' is UTC ISO 8601 text (e.g. "2026-07-24T01:00:00Z"). Rows still
+# in the legacy "YYYY-MM-DD HH:MM:SS HST" text earlier runs wrote are
+# rewritten to UTC on the way through, so the whole master shares one format
+# and old and new copies of an observation dedupe against each other.
 
 suppressPackageStartupMessages(library(dplyr))
 suppressPackageStartupMessages(library(readr))   # much faster than read.csv at master-file scale (millions of rows)
@@ -22,6 +27,16 @@ suppressPackageStartupMessages(library(readr))   # much faster than read.csv at 
 # .err log collects only real problems (warnings and errors). say() matches
 # message() semantics: arguments pasted with no separator, newline appended.
 say <- function(...) cat(..., "\n", sep = "")
+
+# legacy Hawaii-local "... HST" text -> UTC ISO 8601; anything else untouched
+hst_to_utc <- function(x) {
+  hst <- !is.na(x) & endsWith(x, " HST")
+  x[hst] <- format(as.POSIXct(sub(" HST$", "", x[hst]),
+                              format = "%Y-%m-%d %H:%M:%S",
+                              tz = "Pacific/Honolulu"),
+                   "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+  x
+}
 
 # --- directories from the environment --------------------------------------
 # This workflow takes its paths from the environment rather than deriving
@@ -74,10 +89,15 @@ if (!all(cols %in% names(incoming))) {
   stop(new_file, " is missing expected columns: ",
        paste(setdiff(cols, names(incoming)), collapse = ", "))
 }
-incoming <- incoming[cols]
+incoming <- incoming[cols] |> mutate(datetime = hst_to_utc(datetime))
 
 if (file.exists(master_file)) {
   master <- read_csv(master_file, col_types = col_spec, progress = FALSE)[cols]
+  n_hst  <- sum(endsWith(master$datetime, " HST"), na.rm = TRUE)
+  if (n_hst > 0) {
+    say("Converting ", n_hst, " legacy HST master rows to UTC")
+    master <- master |> mutate(datetime = hst_to_utc(datetime))
+  }
   n_before <- nrow(master)
 } else {
   master <- incoming[0, ]

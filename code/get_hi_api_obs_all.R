@@ -1,34 +1,44 @@
 # Catalog-driven incremental pull of api.weather.gov observations for all
 # Hawaii stations in six groups — airports (ICAO PHxx/PMDY), RAWS/MECO-style
 # (NNNHI / NNNHE), RAWS fire-weather (TXNNN), H1 hydro gauges (xxxxH1),
-# HADS coastal (PNN), and buoys (5-digit) — into one long-format table:
-#   station_id | datetime | variable | value | unit | provider
+# HADS coastal (PNN), and buoys (5-digit) — and writes them to the HCDP
+# database's nws_api tables through the acquisition API
+# (code/hcdp_db_acquisition.R):
+#   data             station_id | timestamp | variable | value
+#   variableMetadata variable | unit
+#   stationMetadata  station_id | station_name | data_provider | skn | lat | lng
 #
-# 'provider' is the API's network attribution as provider/subProvider
-# (e.g. "MesoWest/HECO", "HADS", "ASOS"). 'datetime' is Hawaii local
-# time text ending in "HST" (e.g. "2026-07-24 15:00:00 HST").
+# 'data_provider' is the API's network attribution as provider/subProvider
+# (e.g. "MesoWest/HECO", "HADS", "ASOS"). 'timestamp' is UTC ISO 8601
+# text (e.g. "2026-07-24T01:00:00Z"); nothing is converted to local time.
 #
-# How it decides what to fetch (via the station catalog in dataCatalog/):
-#   1. Loads the catalog with get_station_catalog() — reads
+# How it decides what to fetch:
+#   1. Loads the station catalog with get_station_catalog() — reads
 #      dataCatalog/hi_api_stations.csv if present, otherwise builds and
 #      writes it (first run).
 #   2. Keeps stations whose latest_obs_api is within the last 7 days
 #      (alive on the API).
-#   3. Fetches each station from its latest_obs_data to now, with a
-#      12-hour minimum window — e.g. 3 days behind -> fetch 3 days;
-#      only 4 hours behind -> fetch 12 hours. No latest_obs_data at all
-#      (new station) -> fetch the full 7-day retention.
-#   4. After writing data_out/hi_api_obs_long.csv, refreshes the catalog
-#      (refresh = TRUE) so the file reflects this fetch.
+#   3. Asks the HCDP database for each live station's newest timestamp
+#      (hcdp_latest_obs()) and fetches from there to now, with a 12-hour
+#      minimum window — e.g. 3 days behind -> fetch 3 days; only 4 hours
+#      behind -> fetch 12 hours. Not in the database at all (new station)
+#      -> fetch the full 7-day retention.
+#   4. Writes to the database (hcdp_write()): observations and station
+#      metadata are upserted, so a re-fetched value replaces the stored one;
+#      variable metadata is insert-only. Each station's skn comes from the
+#      HCDP master station list, matched on NWS.id exactly as the MADIS
+#      workflow does (null where there is no unambiguous match).
+#   5. Refreshes the catalog (refresh = TRUE) so latest_obs_api is current.
 #
 # Usage:  Rscript code/get_hi_api_obs_all.R
 #         Runs on 1 core -- n_cores is pinned below and any argument is
 #         ignored. Restore the commented-out expression there to re-enable
 #         the [cores] argument.
-# Output: $NWSAPI_DATA_OUT/hi_api_obs_long.csv and
-#         $NWSAPI_DATA_CATALOG/hi_api_stations.csv -- both default to
-#         data_out/ and dataCatalog/ under $NWSAPI_PROJECT_ROOT, which is
-#         REQUIRED in the environment (see the block below)
+# Output: the HCDP database (nothing is written locally except the catalog,
+#         $NWSAPI_DATA_CATALOG/hi_api_stations.csv, default dataCatalog/
+#         under $NWSAPI_PROJECT_ROOT, which is REQUIRED in the environment --
+#         see the block below). Needs the HCDP token in token.env at the
+#         project root, or the file named by $HCDP_TOKEN_FILE.
 
 # progress goes to stdout via say(), not message()/stderr, so the cron job's
 # .err log collects only real problems (warnings and errors). say() matches
@@ -65,16 +75,41 @@ say <- function(...) cat(..., "\n", sep = "")
 }
 mainDir     <- .env_dir("NWSAPI_PROJECT_ROOT")
 codeDir     <- .env_dir("NWSAPI_CODE_DIR",     file.path(mainDir, "code"))
-out_dir     <- .env_dir("NWSAPI_DATA_OUT",     file.path(mainDir, "data_out"),
-                        must_exist = FALSE)
 catalog_dir <- .env_dir("NWSAPI_DATA_CATALOG", file.path(mainDir, "dataCatalog"),
                         must_exist = FALSE)
 
-# loads httr2/dplyr/purrr/tibble/readr/parallel and get_station_catalog();
-# it resolves the same variables independently
+# loads httr2/dplyr/purrr/tibble/readr/parallel, get_station_catalog(), and
+# the UTC timestamp helpers iso_utc()/parse_utc(); it resolves the same
+# variables independently
 source(file.path(codeDir, "get_station_catalog_fn.R"))
+# the HCDP database client: hcdp_latest_obs(), hcdp_write(), and api_url.
+# Reads the token now, so a missing token.env fails here, before any fetching.
+source(file.path(codeDir, "hcdp_db_acquisition.R"))
 
-obs_path <- file.path(out_dir, "hi_api_obs_long.csv")
+# --- HCDP master station list, for skn --------------------------------------
+# Same source and match as the MADIS workflow (madis_hourly_aqs.py): a
+# station's skn is the master list's SKN on the row whose NWS.id equals its
+# station_id. An NWS.id listed more than once is ambiguous and, like a
+# station not in the list, gets a null skn. Loaded before anything is fetched
+# so an unreachable list stops the run early: station metadata is upserted,
+# so falling back to null skns would wipe the stored ones.
+master_meta_url <- Sys.getenv("HCDP_MASTER_META_URL", paste0(
+  "https://raw.githubusercontent.com/ikewai/hawaii_wx_station_mgmt_container/",
+  "main/Hawaii_Master_Station_Meta.csv"))
+master_meta <- request(master_meta_url) |>
+  req_retry(max_tries = 3, retry_on_failure = TRUE) |>
+  req_perform() |>
+  resp_body_string()
+master_meta <- read.csv(text = master_meta, stringsAsFactors = FALSE)
+if (!all(c("SKN", "NWS.id") %in% names(master_meta)))
+  stop("master station list (", master_meta_url, ") has no SKN / NWS.id columns",
+       call. = FALSE)
+master_nws  <- master_meta$NWS.id[!is.na(master_meta$NWS.id) & master_meta$NWS.id != ""]
+skn_dupes   <- unique(master_nws[duplicated(master_nws)])
+skn_lookup  <- master_meta |>
+  filter(NWS.id %in% master_nws, !NWS.id %in% skn_dupes) |>
+  transmute(station_id = NWS.id, skn = SKN)
+say("Master station list: ", nrow(skn_lookup), " unambiguous NWS.id -> SKN entries")
 
 args    <- commandArgs(trailingOnly = TRUE)
 n_cores <- 1 # OFF: if (length(args) >= 1) as.integer(args[1]) else 2
@@ -86,7 +121,6 @@ max_catalog_age <- 24 * 3600     # rebuild the catalog once it is older than thi
 
 ua       <- "R script (hcdp@hawaii.edu)"
 end_time <- Sys.time()
-iso_utc  <- function(t) format(t, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
 
 num_vars <- c(
   "temperature", "dewpoint", "relativeHumidity",
@@ -96,9 +130,6 @@ num_vars <- c(
   "precipitationLastHour", "precipitationLast3Hours", "precipitationLast6Hours",
   "windChill", "heatIndex"
 )
-
-# used by both the catalog age check below and target selection
-parse_hst <- function(x) as.POSIXct(sub(" HST$", "", x), tz = "Pacific/Honolulu")
 
 # --- 1. Catalog: read cache, rebuilding it if stale ------------------------
 # (lives in dataCatalog/ at the project root — the function's default)
@@ -116,7 +147,7 @@ catalog_csv <- file.path(catalog_dir,
 catalog_age <- function(path) {
   if (!file.exists(path)) return(Inf)
   file_age <- as.numeric(Sys.time() - file.mtime(path), units = "secs")
-  ts <- suppressWarnings(parse_hst(read.csv(path)$latest_obs_api))
+  ts <- suppressWarnings(parse_utc(read.csv(path)$latest_obs_api))
   # no usable timestamps (column absent, or an API outage during the last
   # rebuild left it all NA) counts as stale so the next run retries
   data_age <- if (!length(ts) || all(is.na(ts))) Inf else
@@ -150,16 +181,10 @@ select_targets <- function(catalog) {
       provider = ifelse(is.na(provider), NA_character_,
                         ifelse(is.na(sub_provider), provider,
                                paste(provider, sub_provider, sep = "/"))),
-      api_ts   = parse_hst(latest_obs_api),
-      data_ts  = parse_hst(latest_obs_data)
+      api_ts   = parse_utc(latest_obs_api)
     ) |>
     filter(!is.na(group), !is.na(api_ts),
-           api_ts >= end_time - alive_window) |>
-    mutate(
-      fetch_start = pmin(data_ts, end_time - min_fetch),
-      fetch_start = if_else(is.na(fetch_start), end_time - max_fetch, fetch_start),
-      fetch_start = pmax(fetch_start, end_time - max_fetch)
-    )
+           api_ts >= end_time - alive_window)
 }
 targets <- select_targets(catalog)
 
@@ -179,6 +204,19 @@ if (nrow(targets) == 0)
   stop("No stations alive on the API after rebuilding the catalog (",
        nrow(catalog), " stations listed) — the API is likely down or ",
        "returning nothing within the last ", alive_window / 86400, " days.")
+
+# --- 2b. Date range: each live station's newest observation in the database
+say("Looking up the newest observation of ", nrow(targets),
+    " stations in the HCDP database (", api_url, ")...")
+targets <- targets |>
+  mutate(
+    data_ts     = parse_utc(hcdp_latest_obs("nws_api", station_id)),
+    fetch_start = pmin(data_ts, end_time - min_fetch),
+    fetch_start = if_else(is.na(fetch_start), end_time - max_fetch, fetch_start),
+    fetch_start = pmax(fetch_start, end_time - max_fetch)
+  )
+say(sum(!is.na(targets$data_ts)), " of ", nrow(targets),
+    " stations already have data in the database")
 
 say(sprintf(
   "%d of %d catalog stations alive on the API; fetch windows %.1f to %.1f hrs",
@@ -265,13 +303,9 @@ obs_long <- bind_rows(results[!is_err])
 if (nrow(obs_long) == 0) stop("No observations returned.")
 
 # --- 4. Finalize -----------------------------------------------------------
-# convert timestamps to Hawaii local time, written as text ending in "HST"
+# normalize the API's "+00:00" timestamps to UTC ISO 8601 text ending in "Z"
 obs_long <- obs_long |>
-  mutate(datetime = format(
-    as.POSIXct(sub("([+-]\\d{2}):(\\d{2})$", "\\1\\2", datetime),
-               format = "%Y-%m-%dT%H:%M:%S%z", tz = "UTC"),
-    "%Y-%m-%d %H:%M:%S HST", tz = "Pacific/Honolulu"
-  )) |>
+  mutate(datetime = iso_utc(parse_utc(datetime))) |>
   distinct(station_id, datetime, variable, .keep_all = TRUE) |>
   arrange(station_id, datetime, variable)
 
@@ -282,9 +316,47 @@ say(paste(capture.output(print(as.data.frame(sum_by_prov))), collapse = "\n"))
 say(sprintf("TOTAL: %d rows, %d stations reporting (of %d targeted)",
                 nrow(obs_long), n_distinct(obs_long$station_id), nrow(targets)))
 
-dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-write.csv(obs_long, obs_path, row.names = FALSE)
-say("Written to ", obs_path)
+# --- 5. Write to the HCDP database -----------------------------------------
+# Metadata first, so stations and variables exist before their observations.
+# Station metadata is upserted every run, as in the MADIS workflow, so name,
+# provider, location and skn follow the NWS API and the master station list.
+# Variable metadata is insert-only (overwrite = FALSE): new variables are
+# added, existing rows left as they are.
+# data_provider is NOT NULL in the database, and a few stations (buoys among
+# them) list no provider on the NWS API, so those are sent as "unknown"; one
+# null would reject the whole batch. skn may be null.
+station_rows <- targets |>
+  filter(station_id %in% obs_long$station_id) |>
+  left_join(skn_lookup, by = "station_id") |>
+  transmute(station_id, station_name = name,
+            data_provider = coalesce(provider, "unknown"),
+            skn, lat = latitude, lng = longitude)
+amb <- intersect(station_rows$station_id, skn_dupes)
+if (length(amb))
+  say("Ambiguous NWS.id entries in master table this run (treated as unmatched): ",
+      paste(amb, collapse = ", "))
+say(sum(!is.na(station_rows$skn)), " of ", nrow(station_rows),
+    " reporting stations matched to an SKN")
+var_rows <- obs_long |>
+  filter(!is.na(unit)) |>
+  count(variable, unit) |>
+  group_by(variable) |>
+  slice_max(n, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(variable, unit)
+# Observations upsert on station_id + timestamp + variable, so a re-fetched
+# value replaces what the database had. Rows are sorted by station and time,
+# so a run that dies partway leaves each station's newest stored timestamp at
+# the point it reached, and the next run re-fetches from there.
+data_rows <- obs_long |>
+  select(station_id, timestamp = datetime, variable, value)
 
-# --- 5. Refresh the catalog so it reflects this fetch ----------------------
+say("Writing to the HCDP database (", api_url, ")...")
+n_sta <- hcdp_write("nws_api", "stationMetadata", station_rows)
+n_var <- hcdp_write("nws_api", "variableMetadata", var_rows, overwrite = FALSE)
+n_obs <- hcdp_write("nws_api", "data", data_rows)
+say(sprintf("Database: %.0f observation rows written; %.0f station rows upserted, %.0f new variables",
+            n_obs, n_sta, n_var))
+
+# --- 6. Refresh the catalog so latest_obs_api is current -------------------
 invisible(get_station_catalog("HI", cores = n_cores, refresh = TRUE))
