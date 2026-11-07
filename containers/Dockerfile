@@ -18,3 +18,6 @@ RUN Rscript -e "install.packages(c('httr2', 'jsonlite', 'dplyr', 'tibble', 'read
 COPY code/ /workspace/code/
 COPY envs/prod.env /workspace/envs/prod.env
 COPY containers/task.sh /workspace/task.sh
+
+WORKDIR /workspace
+CMD [ "/bin/bash", "task.sh" ]
