@@ -199,7 +199,8 @@ one loaded.
 Rscript code/get_hi_api_obs_all.R    # fetch and write to the database (1 core)
 ```
 
-Run it on a schedule (hourly works well). The script takes every path from
+**Run it once an hour, at :07 past the hour** (cron `7 * * * *`) — see
+[Scheduling](#scheduling) for why :07. The script takes every path from
 the environment, so it can be called from anywhere with no `cd` — but the
 variables must be loaded first, in the same shell:
 
@@ -236,7 +237,12 @@ crontab line that just calls the scripts now aborts every run. The
 `${NWSAPI_CODE_DIR:-...}` default keeps the line correct whether or not that
 optional override is set in the env file.
 
-**:07 past the hour.** Unlike the RR5 product there is no single issuance
+**When: :07 past every hour.** This applies however the job is launched —
+cron here, or the HCDP task runner for the container. Hawaii's offset from
+UTC is a whole number of hours, so :07 is the same minute in HST and UTC,
+and `7 * * * *` is correct whichever timezone the scheduler uses.
+
+**Why :07.** Unlike the RR5 product there is no single issuance
 to wait on — stations report on their own schedules, and the hourly cluster
 runs :45 through :59: RAWS/MECO at :50 and :45 (201 stations), H1 gauges
 sub-hourly at :00/:15/:30/:45 (142), ASOS airports last at :51–:59 (13).
@@ -246,13 +252,20 @@ collects a complete hour. Running at :55 would catch the RAWS block but cut
 the airports off mid-report — no data lost, but airport observations would
 always trail an hour.
 
-:07 also staggers this workflow away from the RR5 job at :45. This one is
-much heavier — ~380 database lookups, ~380 station requests, a few hundred
-batched POSTs (about 250 for a typical 12-hour window of ~120k rows), and a
-full catalog rebuild (~580 listings and one observation request each),
-effectively serial since `n_cores` is pinned to 1. Against a local mock of
-the database a run took under 5 minutes; the live database adds network
-latency to the ~600 database requests, which has not yet been measured.
+:07 also staggers this workflow away from HADS at :20 and RR5 at :45. This
+one is much heavier — ~380 database lookups, ~380 station requests, a few
+hundred batched POSTs (about 200 for a typical hourly run of ~90–100k rows),
+and a full catalog rebuild (~580 listings and one observation request
+each), effectively serial since `n_cores` is pinned to 1. Measured against
+the live database (2026-10-30 → 11-06), an hourly run takes **about 5–6
+minutes**, so it finishes long before :20; a full 7-day catch-up (empty
+database, ~790k rows, ~1,600 POSTs) took about 20 minutes.
+
+**Once an hour, no more often.** Every run already re-fetches at least the
+last 12 hours, so extra runs add load without adding data. Two runs that
+overlap are harmless — writes are keyed upserts, so the database still ends
+up with one row per observation — but they double the requests to both
+APIs. After downtime, just let the next :07 run catch up (up to 7 days).
 
 The `/bin/sh -c '...'` wrapper keeps the redirects applied to the whole
 chain, so anything the env file or the fetcher prints lands in the log
@@ -301,13 +314,16 @@ and push `ghcr.io/hcdp/task-preliminary-nws-api-hourly` via
 `.github/workflows/build-and-push.yml`. The image (on
 `ghcr.io/hcdp/task-base`) installs `httr2`, `jsonlite`, `dplyr`, `tibble`
 and `readr`, and copies `code/`, `envs/prod.env` and `containers/task.sh`.
-`task.sh` sets `TZ=UTC`, sources `envs/prod.env`, and runs the fetcher —
-there is no append step any more.
+`task.sh` sets `TZ=UTC`, sources `envs/prod.env` (which sets
+`NWSAPI_PROJECT_ROOT=/workspace/`), and runs the fetcher — there is no
+append step any more. The image's `CMD` runs `task.sh`. Schedule the
+container **at :07 past every hour**, like the cron job — see
+[Scheduling](#scheduling).
 
-The token is **not** baked into the image: mount it at run time and point
-`HCDP_TOKEN_FILE` at it. Note `envs/prod.env` currently exports a bare
-`PROJECT_ROOT`, not the `NWSAPI_PROJECT_ROOT` the scripts require, so the
-container aborts at startup until that is fixed.
+The token is **not** in the image and is provisioned manually: place it at
+`/workspace/token.env`, or anywhere with `HCDP_TOKEN_FILE` pointing at it.
+Without one the container stops at startup with `token file not found`,
+before fetching anything.
 
 ### Catalog staleness
 
@@ -338,7 +354,7 @@ since every successful run refreshes the catalog at the end.
 | ~~Host cannot reach `api.hcdp.ikewai.org`~~ | resolved by 2026-10-29: connections succeed (connect ~0.14 s) | — |
 | Table renamed upstream: the API's variable-metadata write route is `variableMetadata` since `hcdp_api` commit `089bd97` (2026-10-26); `varMetadata` returns 404 | fixed in this workflow on 2026-10-29 | — |
 | **Gaps in the record** | the stale crontab, the unreachable API, the 403 and the null `data_provider` kept anything from being stored between 2026-10-16T02:41Z and the first successful write. The database starts at `2026-10-23T22:06Z`; `2026-10-16T02:42Z` → `2026-10-22T01:09Z` survives only in a one-off test fetch outside the repo, and `2026-10-22T01:09Z` → `2026-10-23T22:06Z` is lost. The legacy master (Aug 19 – Oct 16) is not in the database | backfill the legacy master and the test-fetch backlog; consider a local spill file when a write fails, since a failed run discards its fetch |
-| `envs/prod.env` exports `PROJECT_ROOT`, not `NWSAPI_PROJECT_ROOT` | the container aborts at startup | rename the variable in `prod.env` |
+| ~~`envs/prod.env` exported `PROJECT_ROOT`, not `NWSAPI_PROJECT_ROOT`~~ | the container aborted at startup | fixed 2026-11-09 in `prod.env` and `dev.env`; the container now needs only its token (provisioned manually) |
 | Not every station has an `skn` | 165 of 305 stations have no unambiguous `NWS.id` match in the master station list (most are HECO `NNNHE` sites; `080HI` and `WUHH1` are listed twice). The `skn` column is nullable, so this is not an error | add the stations, or fix the duplicate `NWS.id`s, in the master station list; the next run picks them up |
 | Live database untested | everything was verified against a local mock built from the API's source (`HCDP/hcdp_api`, `src/app/endpoints/hcdp/acquisition/acquisition.ts`, commit `7bbc552`): ordering and `limit`, upsert vs. insert-only, payload validation, the 100 KB body limit | once the host can connect, make one read-only request to confirm the token, then a real run |
 
