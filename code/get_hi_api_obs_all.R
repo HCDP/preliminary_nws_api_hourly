@@ -28,7 +28,10 @@
 #      variable metadata is insert-only. Each station's skn comes from the
 #      HCDP master station list, matched on NWS.id exactly as the MADIS
 #      workflow does (null where there is no unambiguous match).
-#   5. Refreshes the catalog (refresh = TRUE) so latest_obs_api is current.
+#   5. Optionally rebuilds the catalog so latest_obs_api is current for the
+#      next run -- off by default (NWSAPI_CATALOG_REFRESH_AT_END), since the
+#      workflow runs in a fresh container where the file would be discarded;
+#      step 1's 24 h age check keeps a persisted catalog current regardless.
 #
 # Usage:  Rscript code/get_hi_api_obs_all.R
 #         Runs on 1 core -- n_cores is pinned below and any argument is
@@ -118,6 +121,14 @@ alive_window <- 7 * 24 * 3600    # station considered alive if API has data
 min_fetch    <- 12 * 3600        # never fetch less than this
 max_fetch    <- 7 * 24 * 3600    # API retention; also the new-station window
 max_catalog_age <- 24 * 3600     # rebuild the catalog once it is older than this
+# Rebuild the catalog again at the end of the run? Off by default: each run
+# happens in a fresh container, where a catalog written at the end is thrown
+# away and the next run builds its own at the start. Where dataCatalog/
+# persists between runs, "true" keeps latest_obs_api at most an hour old
+# instead of up to max_catalog_age, at the cost of ~2 min and ~1,150 NWS
+# requests per run.
+refresh_at_end <- tolower(Sys.getenv("NWSAPI_CATALOG_REFRESH_AT_END", "false")) %in%
+  c("true", "1", "yes")
 
 ua       <- "R script (hcdp@hawaii.edu)"
 end_time <- Sys.time()
@@ -358,5 +369,9 @@ n_obs <- hcdp_write("nws_api", "data", data_rows)
 say(sprintf("Database: %.0f observation rows written; %.0f station rows upserted, %.0f new variables",
             n_obs, n_sta, n_var))
 
-# --- 6. Refresh the catalog so latest_obs_api is current -------------------
-invisible(get_station_catalog("HI", cores = n_cores, refresh = TRUE))
+# --- 6. Optionally refresh the catalog for the next run ---------------------
+if (refresh_at_end) {
+  invisible(get_station_catalog("HI", cores = n_cores, refresh = TRUE))
+} else {
+  say("Skipping the end-of-run catalog rebuild (NWSAPI_CATALOG_REFRESH_AT_END is not true)")
+}

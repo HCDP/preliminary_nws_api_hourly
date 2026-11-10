@@ -63,8 +63,11 @@ Each run:
    stored one (16 SI-unit variables requested, 14 of which have ever
    appeared). Timestamps are UTC, ISO 8601 `YYYY-MM-DDTHH:MM:SSZ`; nothing is
    converted to Hawaii local time.
-6. **Refresh the catalog** — the run ends by rebuilding the catalog so
-   `latest_obs_api` is current.
+6. **Optionally refresh the catalog** — off by default
+   (`NWSAPI_CATALOG_REFRESH_AT_END`). The workflow runs in a fresh container
+   each time, so a catalog rebuilt at the end would be thrown away; each run
+   builds or age-checks its own at step 1 instead. See [Catalog
+   staleness](#catalog-staleness).
 
 Catch-up after downtime is automatic: fetch windows stretch to match
 whatever gap the database reveals (up to the API's ~7-day retention — runs
@@ -216,6 +219,7 @@ The database client reads two more variables, both optional:
 | `HCDP_TOKEN_FILE` | `$NWSAPI_PROJECT_ROOT/token.env` | file holding the API token — the bare token, or a `NAME=value` line |
 | `HCDP_API_URL` | `https://api.hcdp.ikewai.org` | API base URL (point it at a test server) |
 | `HCDP_MASTER_META_URL` | the `Hawaii_Master_Station_Meta.csv` URL above | master station list used for `skn` (see [SKN](#skn)) |
+| `NWSAPI_CATALOG_REFRESH_AT_END` | `false` | `true` (or `1` / `yes`) also rebuilds the catalog at the end of each run — only useful where `dataCatalog/` persists between runs |
 
 The token needs `meso_admin` permission, which the API requires for writes.
 A missing or empty token file stops the run at startup, before any fetching.
@@ -254,12 +258,14 @@ always trail an hour.
 
 :07 also staggers this workflow away from HADS at :20 and RR5 at :45. This
 one is much heavier — ~380 database lookups, ~380 station requests, a few
-hundred batched POSTs (about 200 for a typical hourly run of ~90–100k rows),
-and a full catalog rebuild (~580 listings and one observation request
-each), effectively serial since `n_cores` is pinned to 1. Measured against
-the live database (2026-10-30 → 11-06), an hourly run takes **about 5–6
-minutes**, so it finishes long before :20; a full 7-day catch-up (empty
-database, ~790k rows, ~1,600 POSTs) took about 20 minutes.
+hundred batched POSTs (about 200 for a typical hourly run of ~90–110k
+rows), and — in a fresh container, or when the cached catalog is over 24 h
+old — a catalog build (~580 listings and one observation request each), all
+effectively serial since `n_cores` is pinned to 1. Measured against the live
+database, an hourly run takes **about 5 minutes** (a fresh-container run on
+2026-11-09, catalog build included: 312 s), so it finishes long before :20;
+a full 7-day catch-up (empty database, ~790k rows, ~1,600 POSTs) took about
+20 minutes.
 
 **Once an hour, no more often.** Every run already re-fetches at least the
 last 12 hours, so extra runs add load without adding data. Two runs that
@@ -303,9 +309,13 @@ The fetcher needs exactly **three** other local files.
 
 Everything else is optional, and is created or rebuilt automatically:
 
-- `dataCatalog/hi_api_stations.csv` — built from the API if missing, and
-  rebuilt if stale (see below). Having it just saves ~2 min on a run.
-- `dataCatalog/` — created on demand.
+- `dataCatalog/hi_api_stations.csv` — a cache, **not** state: built from the
+  API if missing, and rebuilt if stale (see below). What has been collected
+  lives in the database, so a run that starts without it — every run in a
+  fresh container — loses nothing; keeping it just saves ~2 min on a run.
+- `dataCatalog/` — created on demand. It must be writable, because each run
+  that builds the catalog writes it there, even in a container where the
+  file is discarded afterwards.
 
 ### Container
 
@@ -318,7 +328,10 @@ and `readr`, and copies `code/`, `envs/prod.env` and `containers/task.sh`.
 `NWSAPI_PROJECT_ROOT=/workspace/`), and runs the fetcher — there is no
 append step any more. The image's `CMD` runs `task.sh`. Schedule the
 container **at :07 past every hour**, like the cron job — see
-[Scheduling](#scheduling).
+[Scheduling](#scheduling). Nothing needs to persist between container runs:
+each run builds its station catalog at the start and, with
+`NWSAPI_CATALOG_REFRESH_AT_END` at its default `false`, does not rebuild it
+at the end.
 
 The token is **not** in the image and is provisioned manually: place it at
 `/workspace/token.env`, or anywhere with `HCDP_TOKEN_FILE` pointing at it.
@@ -329,10 +342,11 @@ before fetching anything.
 
 The fetcher only pulls stations whose `latest_obs_api` is within
 `alive_window` (7 days), so a catalog older than that matches no stations at
-all — and the end-of-run refresh that would fix it is never reached, leaving
-the pipeline permanently stuck. To prevent that, the catalog is age-checked
-before use and rebuilt when older than `max_catalog_age` (24 h). Staleness is
-measured two ways, and **either** one triggers a rebuild:
+all — and a run that targets no stations never reaches the point where it
+could refresh the catalog, leaving the pipeline permanently stuck. To prevent
+that, the catalog is age-checked before use and rebuilt when older than
+`max_catalog_age` (24 h). Staleness is measured two ways, and **either** one
+triggers a rebuild:
 
 | Check | Catches |
 |---|---|
@@ -342,8 +356,17 @@ measured two ways, and **either** one triggers a rebuild:
 A missing file, an absent `latest_obs_api` column, or an all-`NA` column (an
 API outage during the last rebuild) all count as stale. As a backstop, if a
 *cached* catalog yields zero live stations the fetcher forces one rebuild and
-retries before giving up. In normal hourly operation none of this fires,
-since every successful run refreshes the catalog at the end.
+retries before giving up.
+
+This check is also what keeps a *persisted* catalog current now that the
+end-of-run rebuild is off by default: where `dataCatalog/` survives between
+runs (the cron job on this host), the first run after the file turns 24 h
+old rebuilds it, so `latest_obs_api` is at most a day old. That only decides
+which stations count as alive; a station that comes back online is picked
+up at the next rebuild with its full backlog, since the NWS API keeps 7
+days. In a fresh container the file is always missing, so every run builds
+it. Set `NWSAPI_CATALOG_REFRESH_AT_END=true` to rebuild after every run
+instead.
 
 ## Known issues
 
