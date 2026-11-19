@@ -18,6 +18,28 @@ station catalog is written locally.
 
 ![NWS API observations workflow](workflow_api.svg)
 
+## Running the workflow
+
+**The whole workflow is one file: `code/get_hi_api_obs_all.R`.** Running it
+loads the station catalog, asks the HCDP database what it already holds,
+fetches what is missing from the NWS API, and writes it to the database.
+It loads its two helpers (`code/get_station_catalog_fn.R`,
+`code/hcdp_db_acquisition.R`) itself. Nothing else needs to run — there is
+no append step and no separate catalog step.
+
+| | |
+|---|---|
+| **When** | once an hour, at **:07 past the hour** (cron `7 * * * *`) — the same minute in HST and UTC; see [Scheduling](#scheduling) for why |
+| **How long** | about **5 minutes** for an hourly run; about 20 minutes for a full 7-day catch-up (an empty database, or after a week of downtime) |
+| **Needs** | `NWSAPI_PROJECT_ROOT` set — `envs/nwsapi.env` here, `envs/prod.env` in the container — and the HCDP API token, in the `HCDP_API_TOKEN` environment variable (default) or a `token.env` file |
+
+```bash
+. envs/nwsapi.env && Rscript code/get_hi_api_obs_all.R
+```
+
+In the container, `task.sh` (the image's `CMD`) does exactly this: it
+sources `envs/prod.env` and runs that one file.
+
 ## How it works
 
 The pipeline is driven by two sources of truth:
@@ -135,11 +157,11 @@ from any working directory — and refuse to run at all without it.
 $NWSAPI_PROJECT_ROOT/    <- REQUIRED; dataCatalog/ lands here
 |-- code/                <- the .R files live here, together
 |-- envs/nwsapi.env      <- the variables, ready to source
-`-- token.env            <- HCDP API token (gitignored; never committed)
+`-- token.env            <- optional token file, if HCDP_API_TOKEN is unset (gitignored)
 ```
 
 Nothing is inferred from a script's own location. `NWSAPI_PROJECT_ROOT` must
-be exported before either script runs; an unset root, or one pointing at a
+be exported before the fetcher runs; an unset root, or one pointing at a
 directory that does not exist, is a fatal error rather than a silent
 fallback. See [Directory configuration](#directory-configuration).
 
@@ -153,7 +175,7 @@ fallback. See [Directory configuration](#directory-configuration).
 | `cron_api.txt` | ready-to-install hourly crontab entry |
 | `envs/nwsapi.env` | the required directory variables, ready to `source` |
 | `containers/Dockerfile`, `containers/task.sh`, `envs/prod.env` | container image and entrypoint — see [Container](#container) |
-| `token.env` | HCDP API token, read at run time (gitignored) |
+| `token.env` | fallback HCDP API token file, read only when `HCDP_API_TOKEN` is unset (gitignored) |
 | `dataCatalog/hi_api_stations.csv` | station catalog with `latest_obs_api` |
 | `data_out/hi_api_master.csv` | legacy local record (Aug 19 – Oct 15 2026, UTC); no longer written — see [Legacy local data](#legacy-local-data) |
 | `runlogs/` | cron stdout/stderr logs (gitignored) |
@@ -212,17 +234,24 @@ variables must be loaded first, in the same shell:
   Rscript "$NWSAPI_PROJECT_ROOT/code/get_hi_api_obs_all.R"
 ```
 
-The database client reads two more variables, both optional:
+The fetcher also reads these variables, all optional:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HCDP_TOKEN_FILE` | `$NWSAPI_PROJECT_ROOT/token.env` | file holding the API token — the bare token, or a `NAME=value` line |
+| `HCDP_API_TOKEN` | — | **the API token itself — the default way to supply it** (as the HCDP task runner does for MADIS) |
+| `HCDP_TOKEN_FILE` | `$NWSAPI_PROJECT_ROOT/token.env` | token file, used only when `HCDP_API_TOKEN` is unset or empty — the bare token, or a `NAME=value` line |
 | `HCDP_API_URL` | `https://api.hcdp.ikewai.org` | API base URL (point it at a test server) |
 | `HCDP_MASTER_META_URL` | the `Hawaii_Master_Station_Meta.csv` URL above | master station list used for `skn` (see [SKN](#skn)) |
 | `NWSAPI_CATALOG_REFRESH_AT_END` | `false` | `true` (or `1` / `yes`) also rebuilds the catalog at the end of each run — only useful where `dataCatalog/` persists between runs |
 
 The token needs `meso_admin` permission, which the API requires for writes.
-A missing or empty token file stops the run at startup, before any fetching.
+Each run logs where its token came from (`HCDP API token: from
+HCDP_API_TOKEN`, or the file path) — never the token itself. With neither a
+non-empty `HCDP_API_TOKEN` nor a token file, the run stops at startup,
+before any fetching: `No HCDP API token: set HCDP_API_TOKEN, or provide a
+token file (...)`. The cron job on this host sets no `HCDP_API_TOKEN`, so it
+uses `token.env`. Never put the token in `envs/*.env` — those files are
+committed.
 
 ### Scheduling
 
@@ -294,14 +323,16 @@ bound; rotate or truncate them if that matters.
 
 ### What a run needs locally
 
-The fetcher needs exactly **three** other local files.
+The fetcher needs **two** other local files — the helpers it sources —
+plus the token, which by default is an environment variable rather than a
+file.
 
 | Needed | Why |
 |---|---|
 | `NWSAPI_PROJECT_ROOT` exported | every path derives from it; unset is fatal at startup. See [Directory configuration](#directory-configuration). |
 | `code/get_station_catalog_fn.R` | sourced by the fetcher; must sit in `$NWSAPI_CODE_DIR`. Missing it is fatal at startup. |
 | `code/hcdp_db_acquisition.R` | the database client, sourced likewise. |
-| `token.env` | the HCDP API token (or the file `$HCDP_TOKEN_FILE` names). Missing it is fatal at startup. |
+| the HCDP API token | in `HCDP_API_TOKEN` (default), or else in `token.env` / the file `$HCDP_TOKEN_FILE` names. Having neither is fatal at startup. |
 | R ≥ 4.1 plus `httr2`, `jsonlite`, `dplyr`, `purrr`, `tibble`, `readr` | `parallel` ships with R. `jsonlite` is only *suggested* by `httr2`, so it must be listed explicitly. Run `Rscript code/install_deps.R` once. |
 | network access to `api.weather.gov` | no API key — the API only requires a `User-Agent` header, set in the scripts |
 | network access to `api.hcdp.ikewai.org` | the database lookups and writes; an unreachable API fails the run before it fetches |
@@ -333,9 +364,12 @@ each run builds its station catalog at the start and, with
 `NWSAPI_CATALOG_REFRESH_AT_END` at its default `false`, does not rebuild it
 at the end.
 
-The token is **not** in the image and is provisioned manually: place it at
-`/workspace/token.env`, or anywhere with `HCDP_TOKEN_FILE` pointing at it.
-Without one the container stops at startup with `token file not found`,
+The token is **not** in the image and is provisioned manually — by
+default as the `HCDP_API_TOKEN` environment variable of the container (how
+the HCDP task runner passes it to the MADIS container). A token file also
+works: `/workspace/token.env`, or anywhere with `HCDP_TOKEN_FILE` pointing
+at it; it is read only when `HCDP_API_TOKEN` is unset or empty. With
+neither, the container stops at startup with `No HCDP API token: ...`,
 before fetching anything.
 
 ### Catalog staleness
@@ -385,5 +419,6 @@ instead.
 is how the mock was used.
 
 See `../WORKFLOWS.md` for the index of the four hourly workflows. Note that
-this workflow now writes to the HCDP database, while the companion RR5 and
-HADS workflows still keep local master CSVs.
+this workflow and the companion RR5 workflow now write to the HCDP
+database (`nws_api` and `nws_rr5` tables), while HADS still keeps a local
+master CSV.

@@ -40,8 +40,9 @@
 # Output: the HCDP database (nothing is written locally except the catalog,
 #         $NWSAPI_DATA_CATALOG/hi_api_stations.csv, default dataCatalog/
 #         under $NWSAPI_PROJECT_ROOT, which is REQUIRED in the environment --
-#         see the block below). Needs the HCDP token in token.env at the
-#         project root, or the file named by $HCDP_TOKEN_FILE.
+#         see the block below). Needs the HCDP API token: by default from
+#         $HCDP_API_TOKEN, otherwise from token.env at the project root or the
+#         file named by $HCDP_TOKEN_FILE.
 
 # progress goes to stdout via say(), not message()/stderr, so the cron job's
 # .err log collects only real problems (warnings and errors). say() matches
@@ -86,7 +87,7 @@ catalog_dir <- .env_dir("NWSAPI_DATA_CATALOG", file.path(mainDir, "dataCatalog")
 # variables independently
 source(file.path(codeDir, "get_station_catalog_fn.R"))
 # the HCDP database client: hcdp_latest_obs(), hcdp_write(), and api_url.
-# Reads the token now, so a missing token.env fails here, before any fetching.
+# Reads the token now, so a missing token fails here, before any fetching.
 source(file.path(codeDir, "hcdp_db_acquisition.R"))
 
 # --- HCDP master station list, for skn --------------------------------------
