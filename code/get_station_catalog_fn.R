@@ -1,7 +1,7 @@
 # Sourceable version of get_hi_station_catalog.R: the catalog build is a
-# cache-aware function, and the table gains a latest_obs column — the
-# timestamp of each station's most recent observation (HST text; NA if the
-# station has none).
+# cache-aware function, and the table gains a latest_obs_api column — the
+# timestamp of each station's most recent observation on the NWS API (UTC
+# ISO 8601 text, e.g. "2026-07-24T01:00:00Z"; NA if the station has none).
 #
 # As a library:
 #   source("code/get_station_catalog_fn.R")
@@ -11,26 +11,19 @@
 #
 # Arguments:
 #   state     state code for the api.weather.gov catalog (default "HI")
-#   latest    add two most-recent-data columns when building (default TRUE):
-#               latest_obs_api  — timestamp of the station's newest
-#                                 observation on the NWS API right now
-#                                 (one API call per station, parallelized
-#                                 on `cores`; NA = nothing in ~7-day store)
-#               latest_obs_data — max datetime per station in YOUR collected
-#                                 long-format data (from obs_file; NA = not
-#                                 in that file)
+#   latest    add the latest_obs_api column when building (default TRUE):
+#               timestamp of the station's newest observation on the NWS
+#               API right now (one API call per station, parallelized on
+#               `cores`; NA = nothing in ~7-day store). What has already
+#               been collected is not tracked here -- the fetcher asks the
+#               HCDP database for that (hcdp_latest_obs()).
 #   cores     workers for the latest_obs_api lookup (default 2)
-#   obs_file  long-format data file for latest_obs_data (default
-#             data_out/hi_api_obs_long.csv at the PROJECT ROOT, i.e. the
-#             parent of code/ — not the working directory; point at
-#             data_out/hi_api_master.csv for the full record). If the
-#             file is missing, latest_obs_data is NA with a warning.
 #   dir       directory holding the catalog CSV (default: dataCatalog/ at
 #             the project root — NOT the working directory — created if
 #             missing; file is <state>_api_stations.csv inside it)
 #   write_csv when building, save the catalog there (default TRUE)
 #   refresh   TRUE = ignore any existing CSV, rebuild from the API and
-#             overwrite so stations + both latest columns are current
+#             overwrite so stations + latest_obs_api are current
 #             (default FALSE: an existing CSV is read and returned as-is,
 #             no API calls)
 #
@@ -49,6 +42,25 @@ suppressPackageStartupMessages(library(parallel))
 # .err log collects only real problems (warnings and errors). say() matches
 # message() semantics: arguments pasted with no separator, newline appended.
 say <- function(...) cat(..., "\n", sep = "")
+
+# --- timestamps --------------------------------------------------------------
+# Every timestamp this workflow writes is UTC ISO 8601 text ending in "Z"
+# (e.g. "2026-07-24T01:00:00Z"); nothing is converted to local time.
+# parse_utc() reads that, the NWS API's offset form ("2026-07-24T01:00:00+00:00"),
+# the HCDP API's fractional seconds ("2026-07-24T01:00:00.000Z"), and the legacy
+# "YYYY-MM-DD HH:MM:SS HST" text earlier runs wrote, so files already on disk
+# still read correctly.
+iso_utc   <- function(t) format(t, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+parse_utc <- function(x) {
+  x   <- as.character(x)
+  iso <- sub("\\.[0-9]+(Z|[+-][0-9:]+)$", "\\1", x)   # drop fractional seconds
+  out <- as.POSIXct(sub("Z$", "+0000", sub("([+-]\\d{2}):(\\d{2})$", "\\1\\2", iso)),
+                    format = "%Y-%m-%dT%H:%M:%S%z", tz = "UTC")
+  hst <- !is.na(x) & endsWith(x, " HST")
+  out[hst] <- as.POSIXct(sub(" HST$", "", x[hst]), format = "%Y-%m-%d %H:%M:%S",
+                         tz = "Pacific/Honolulu")
+  out
+}
 
 # --- directories from the environment --------------------------------------
 # This workflow takes its paths from the environment rather than deriving
@@ -81,14 +93,10 @@ say <- function(...) cat(..., "\n", sep = "")
 }
 .data_dir    <- .env_dir("NWSAPI_PROJECT_ROOT")
 .code_dir    <- .env_dir("NWSAPI_CODE_DIR",     file.path(.data_dir, "code"))
-.out_dir     <- .env_dir("NWSAPI_DATA_OUT",     file.path(.data_dir, "data_out"),
-                         must_exist = FALSE)
 .catalog_dir <- .env_dir("NWSAPI_DATA_CATALOG", file.path(.data_dir, "dataCatalog"),
                          must_exist = FALSE)
 
 get_station_catalog <- function(state = "HI", latest = TRUE, cores = 2,
-                                obs_file = file.path(.out_dir,
-                                                     "hi_api_obs_long.csv"),
                                 dir = .catalog_dir,
                                 write_csv = TRUE, refresh = FALSE,
                                 ua = "R script (hcdp@hawaii.edu)") {
@@ -98,7 +106,7 @@ get_station_catalog <- function(state = "HI", latest = TRUE, cores = 2,
   # --- cached copy? -------------------------------------------------------
   if (!refresh && file.exists(csv_path)) {
     say("Reading existing catalog: ", csv_path,
-            " (last modified ", format(file.mtime(csv_path)), ")")
+            " (last modified ", iso_utc(file.mtime(csv_path)), ")")
     return(read.csv(csv_path))
   }
 
@@ -164,36 +172,9 @@ get_station_catalog <- function(state = "HI", latest = TRUE, cores = 2,
       raw <- lapply(catalog$station_id, worker, ua = ua)
     }
     ts_api <- unlist(raw)
-    catalog$latest_obs_api <- format(
-      as.POSIXct(sub("([+-]\\d{2}):(\\d{2})$", "\\1\\2", ts_api),
-                 format = "%Y-%m-%dT%H:%M:%S%z", tz = "UTC"),
-      "%Y-%m-%d %H:%M:%S HST", tz = "Pacific/Honolulu"
-    )
+    catalog$latest_obs_api <- iso_utc(parse_utc(ts_api))
     say(sum(!is.na(catalog$latest_obs_api)),
             " stations have observations on the API")
-
-    # --- latest_obs_data: newest datetime in collected long data ----------
-    if (file.exists(obs_file)) {
-      say("Deriving latest_obs_data from ", obs_file)
-      obs <- read_csv(obs_file, col_types = cols_only(
-        station_id = col_character(), datetime = col_character()),
-        progress = FALSE)
-      latest_tbl <- obs |>
-        mutate(ts = as.POSIXct(sub(" HST$", "", datetime),
-                               tz = "Pacific/Honolulu")) |>
-        group_by(station_id) |>
-        summarise(latest_obs_data = format(max(ts, na.rm = TRUE),
-                                           "%Y-%m-%d %H:%M:%S HST",
-                                           tz = "Pacific/Honolulu"),
-                  .groups = "drop")
-      catalog <- left_join(catalog, latest_tbl, by = "station_id")
-      say(sum(!is.na(catalog$latest_obs_data)), " of ", nrow(catalog),
-              " stations have data in ", obs_file)
-    } else {
-      warning("obs file not found (", obs_file,
-              ") — latest_obs_data set to NA", call. = FALSE, immediate. = TRUE)
-      catalog$latest_obs_data <- NA_character_
-    }
   }
 
   # --- save ---------------------------------------------------------------
